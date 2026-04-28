@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Simulation / analysis outputs (regenerate locally)
+orbitnet/results.csv
+orbitnet/results_analysis.png
+
+# IDE / local
+.claude/
+.idea/
+.vscode/
+*.swp
+.DS_Store

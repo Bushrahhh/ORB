@@ -103,14 +103,19 @@ class MetricsDashboard:
     # ── Master draw ──────────────────────────────────────────────────────────
     def draw(self, surface: pygame.Surface, satellites: list, debris_list: list,
              network, metrics, event_log: list,
-             sim_time: float, sim_speed: int) -> None:
+             sim_time: float, sim_speed: int,
+             display_positions: dict | None = None,
+             chaos_mode: bool = False,
+             anim_t: float = 0.0) -> None:
+        if display_positions is None:
+            display_positions = {s.sat_id: s.position for s in satellites}
         self._draw_panel_bg(surface)
-        self._draw_title(surface)
+        self._draw_title(surface, chaos_mode, anim_t)
         self._draw_constellation(surface, satellites)
         self._draw_network_metrics(surface, network)
         self._draw_collision_stats(surface, satellites, debris_list, metrics)
         self._draw_event_log(surface, event_log)
-        self._draw_mini_graph(surface, satellites, network)
+        self._draw_mini_graph(surface, satellites, network, display_positions)
         self._draw_sim_info(surface, sim_time, sim_speed)
 
     # ── Panel background ─────────────────────────────────────────────────────
@@ -133,13 +138,20 @@ class MetricsDashboard:
         surface.blit(val, (PANEL_X + PANEL_W - PAD - val.get_width(), y))
 
     # ── Title ────────────────────────────────────────────────────────────────
-    def _draw_title(self, surface):
+    def _draw_title(self, surface, chaos_mode: bool, anim_t: float):
         y0, y1 = _SEC["title"]
         pygame.draw.rect(surface, (18, 0, 36), (PANEL_X, y0, PANEL_W, y1 - y0))
         t1 = self._f_title.render("ORB — LEO CCN SIMULATION", True, BORDER_C)
         t2 = self._f_small.render("CE313 · CCN Assignment · Phase 2", True, TXT_SEC)
         surface.blit(t1, (PANEL_X + PAD, y0 + 10))
         surface.blit(t2, (PANEL_X + PAD, y0 + 32))
+        if chaos_mode:
+            pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(anim_t * 6.0))
+            r = int(200 + 55 * pulse)
+            g = int(40 + 80 * (1.0 - pulse))
+            b = int(90 + 100 * pulse)
+            chaos_s = self._f_title.render("CHAOS MODE ACTIVE", True, (r, g, b))
+            surface.blit(chaos_s, (PANEL_X + PANEL_W - chaos_s.get_width() - PAD, y0 + 8))
 
     # ── Constellation status grid ────────────────────────────────────────────
     def _draw_constellation(self, surface, satellites):
@@ -232,7 +244,7 @@ class MetricsDashboard:
             surface.blit(msg_s, (PANEL_X + PAD + ts_s.get_width() + 4, y))
 
     # ── Mini ISL network graph ─────────────────────────────────────────────────
-    def _draw_mini_graph(self, surface, satellites, network):
+    def _draw_mini_graph(self, surface, satellites, network, display_positions):
         y0, y1 = _SEC["minigraph"]
         self._section_header(surface, y0, "NETWORK TOPOLOGY")
 
@@ -257,7 +269,10 @@ class MetricsDashboard:
                 gs_mini[n] = (gx, gy)
 
         # Satellite mini positions
-        sat_mini = {s.sat_id: _proj_mini(s.position) for s in satellites}
+        sat_mini = {
+            s.sat_id: _proj_mini(display_positions.get(s.sat_id, s.position))
+            for s in satellites
+        }
         all_mini = {**sat_mini, **gs_mini}
 
         # Edges
@@ -301,7 +316,7 @@ class MetricsDashboard:
         s = sim_time % 60
         t_str = f"SIM TIME  {int(h):02d}:{int(m):02d}:{s:05.2f}"
         sp_str = f"SPEED  {sim_speed}×"
-        ctrl = "SPC pause  ± speed  R reset  ESC quit"
+        ctrl = "SPC pause  ± speed  C chaos  G graphs  click sat  R reset  Q quit"
 
         t_lbl  = self._f_mono.render(t_str,  True, TXT_PRI)
         sp_lbl = self._f_mono.render(sp_str, True, WARN_C)

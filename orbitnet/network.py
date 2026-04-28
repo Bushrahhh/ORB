@@ -143,11 +143,12 @@ class ConstellationNetwork:
                 )
         return True
 
-    def tick(self, dt: float) -> None:
+    def tick(self, dt: float, satellites: list | None = None) -> None:
         """
         Advance in-flight packets by dt simulation-seconds.
         Deliver packets whose accumulated delay has elapsed.
         """
+        by_id = {s.sat_id: s for s in satellites} if satellites else {}
         dt_ms = dt * 1000.0
         still_flying = []
         for entry in self._in_flight:
@@ -167,6 +168,9 @@ class ConstellationNetwork:
                 self.total_delivered += 1
                 if pkt.latency_ms is not None:
                     self._latencies.append(pkt.latency_ms)
+                dest = pkt.destination
+                if isinstance(dest, int) and dest in by_id:
+                    by_id[dest].messages_received += 1
             else:
                 entry[1] = remaining
                 still_flying.append(entry)
@@ -198,6 +202,17 @@ class ConstellationNetwork:
             (u, v): self.graph[u][v].get("current_load", 0.0)
             for u, v in self.graph.edges()
         }
+
+    def in_flight_queue_depth(self, sat_id: int) -> int:
+        """Packets in transit that involve this node (source, dest, or on path)."""
+        n = 0
+        for pkt, _, _ in self._in_flight:
+            if pkt.source == sat_id or pkt.destination == sat_id:
+                n += 1
+                continue
+            if pkt.path and sat_id in pkt.path:
+                n += 1
+        return n
 
     def get_network_stats(self) -> dict:
         util = self.get_link_utilization()

@@ -2,6 +2,8 @@ import math
 import sys
 import os
 import collections
+import subprocess
+import random
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -12,11 +14,17 @@ from config import (
     NUM_SATELLITES, NUM_ORBITAL_PLANES, SIMULATION_SPEED,
     SCREEN_WIDTH, SCREEN_HEIGHT, FPS, COLORS,
 )
-from agents import create_constellation, create_debris, State
+from agents import (
+    create_constellation, create_debris, State,
+    spawn_chaos_debris,
+)
 from network import ConstellationNetwork
 from metrics import MetricsCollector
 from ui.renderer import OrbitalRenderer
 from ui.dashboard import MetricsDashboard
+
+# Internal physics step (sim seconds). Smaller = smoother motion at high time warp.
+FIXED_SIM_DT = 0.05
 
 # ── Event record ────────────────────────────────────────────────────────────
 class _Event:
@@ -39,6 +47,47 @@ def _all_positions(satellites, debris_list):
     return pos
 
 
+def _lerp3(a: tuple, b: tuple, t: float) -> tuple:
+    t = max(0.0, min(1.0, t))
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+def _interpolated_positions(start_pos: dict, end_pos: dict, alpha: float) -> dict:
+    keys = set(start_pos) | set(end_pos)
+    out = {}
+    for k in keys:
+        if k in start_pos and k in end_pos:
+            out[k] = _lerp3(start_pos[k], end_pos[k], alpha)
+        elif k in end_pos:
+            out[k] = end_pos[k]
+        else:
+            out[k] = start_pos[k]
+    return out
+
+
+def _next_debris_id(debris_list):
+    return max((d.debris_id for d in debris_list), default=99) + 1
+
+
+def _run_analysis_and_open():
+    base = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(base, "results.csv")
+    png_path = os.path.join(base, "results_analysis.png")
+    try:
+        import analysis as orbit_analysis
+        orbit_analysis.generate_plots(csv_path, png_path)
+    except Exception as ex:
+        print(f"  Analysis failed: {ex}")
+        return
+    if os.path.isfile(png_path):
+        if sys.platform == "win32":
+            os.startfile(png_path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", png_path], check=False)
+        else:
+            subprocess.run(["xdg-open", png_path], check=False)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 def run():
     pygame.init()
@@ -46,7 +95,6 @@ def run():
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     clock  = pygame.time.Clock()
 
-    # ── Subsystems ───────────────────────────────────────────────────────────
     orb        = OrbitalMechanics()
     satellites = create_constellation(orb)
     debris     = create_debris(orb, count=5)
@@ -58,27 +106,30 @@ def run():
     renderer.init_fonts()
     dashboard.init_fonts()
 
-    # ── Simulation state ─────────────────────────────────────────────────────
     sim_time     = 0.0
     sim_speed    = SIMULATION_SPEED
     paused       = False
     event_log    = collections.deque(maxlen=50)
+    chaos_mode   = False
+    chaos_inj_accum = 0.0
+    next_debris_id = _next_debris_id(debris)
+    selected_sat = None
 
-    # Initial topology so the dashboard isn't empty on frame 0
     ap = _all_positions(satellites, debris)
     network.update_topology({k: v for k, v in ap.items() if k < 100})
 
     prev_states  = {s.sat_id: s.state for s in satellites}
     metrics_tick = 0.0
+    sim_accum    = 0.0
+    curr_snap    = _all_positions(satellites, debris)
+    prev_snap    = dict(curr_snap)
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
     running = True
     while running:
-        dt_real = clock.tick(FPS) / 1000.0          # seconds of real time
-        dt_real = min(dt_real, 0.05)                 # cap for pause / lag
-        anim_t  = pygame.time.get_ticks() / 1000.0  # real-time for animations
+        dt_real = clock.tick(FPS) / 1000.0
+        dt_real = min(dt_real, 0.05)
+        anim_t  = pygame.time.get_ticks() / 1000.0
 
-        # ── Events ────────────────────────────────────────────────────────────
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
@@ -95,23 +146,57 @@ def run():
                     sim_speed = min(sim_speed + 10, 500)
                 elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                     sim_speed = max(sim_speed - 10, 1)
+                elif ev.key == pygame.K_c:
+                    chaos_mode = not chaos_mode
+                    event_log.appendleft(_Event(
+                        sim_time, "INFO",
+                        f"Chaos mode {'ON' if chaos_mode else 'OFF'}"
+                    ))
+                elif ev.key == pygame.K_g:
+                    out_csv = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "results.csv"
+                    )
+                    metrics.export_csv(out_csv)
+                    _run_analysis_and_open()
                 elif ev.key == pygame.K_r:
-                    # Reset
                     satellites  = create_constellation(orb)
                     debris      = create_debris(orb, count=5)
                     network     = ConstellationNetwork()
                     metrics     = MetricsCollector()
                     sim_time    = 0.0
+                    sim_accum   = 0.0
+                    chaos_inj_accum = 0.0
+                    next_debris_id = _next_debris_id(debris)
+                    selected_sat = None
                     event_log.clear()
                     event_log.appendleft(_Event(0.0, "INFO", "Simulation RESET"))
                     prev_states = {s.sat_id: s.state for s in satellites}
+                    ap = _all_positions(satellites, debris)
+                    curr_snap = dict(ap)
+                    prev_snap = dict(curr_snap)
+                    network.update_topology({k: v for k, v in ap.items() if k < 100})
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                mx, my = ev.pos
+                if mx < 900:
+                    disp = _all_positions(satellites, debris)
+                    hit = renderer.pick_satellite_at(
+                        satellites, mx, my, display_positions=disp
+                    )
+                    selected_sat = hit
 
         if paused:
-            # Still draw, just don't advance sim
-            renderer.draw(screen, satellites, debris, network, anim_t)
-            dashboard.draw(screen, satellites, debris, network, metrics,
-                           event_log, sim_time, sim_speed)
-            # "PAUSED" overlay text
+            disp = _all_positions(satellites, debris)
+            renderer.draw(
+                screen, satellites, debris, network, anim_t,
+                display_positions=disp,
+                screen_wh=(SCREEN_WIDTH, SCREEN_HEIGHT),
+                selected_sat=selected_sat,
+            )
+            dashboard.draw(
+                screen, satellites, debris, network, metrics,
+                event_log, sim_time, sim_speed,
+                display_positions=disp, chaos_mode=chaos_mode, anim_t=anim_t,
+            )
             font = pygame.font.SysFont("monospace", 28, bold=True)
             txt  = font.render("  PAUSED  ", True, COLORS["TEXT_PRIMARY"],
                                COLORS["PANEL_BG"])
@@ -119,62 +204,97 @@ def run():
             pygame.display.flip()
             continue
 
-        # ── Simulation step ────────────────────────────────────────────────────
-        dt_sim = dt_real * sim_speed        # simulation seconds per real frame
-        sim_time += dt_sim
+        dt_sim = dt_real * sim_speed
+        sim_accum += dt_sim
+        substeps_this_frame = 0
 
-        ap = _all_positions(satellites, debris)
-        sat_pos = {k: v for k, v in ap.items() if k < 100}
-        network.update_topology(sat_pos)
+        while sim_accum >= FIXED_SIM_DT:
+            sim_accum -= FIXED_SIM_DT
+            sub = FIXED_SIM_DT
+            substeps_this_frame += 1
+            prev_snap = dict(curr_snap)
 
-        # Step all agents
-        for sat in satellites:
-            sat.step(sim_time, dt_sim, ap, network)
-        for d in debris:
-            d.step(sim_time, dt_sim, ap, network)
-
-        network.tick(dt_sim)
-
-        # ── State change detection → event log ────────────────────────────────
-        for sat in satellites:
-            if sat.state != prev_states[sat.sat_id]:
-                new_s = sat.state
-                if new_s == State.WARNING:
-                    event_log.appendleft(_Event(
-                        sim_time, "ALERT",
-                        f"SAT {sat.sat_id} → WARNING proximity"
-                    ))
-                elif new_s == State.MANEUVERING:
-                    metrics.total_maneuvers += 1
-                    event_log.appendleft(_Event(
-                        sim_time, "MANEUVER",
-                        f"SAT {sat.sat_id} → MANEUVERING avoidance burn"
-                    ))
-                elif new_s == State.SAFE:
+            if chaos_mode:
+                chaos_inj_accum += sub
+                if chaos_inj_accum >= 30.0:
+                    chaos_inj_accum = 0.0
+                    rng = random.Random(int(sim_time * 1000) & 0xFFFFFFFF)
+                    for _ in range(3):
+                        target = rng.choice(satellites)
+                        debris.append(
+                            spawn_chaos_debris(next_debris_id, target.position, rng)
+                        )
+                        next_debris_id += 1
                     event_log.appendleft(_Event(
                         sim_time, "INFO",
-                        f"SAT {sat.sat_id} → SAFE maneuver complete"
+                        "Chaos: injected 3 intercept debris objects"
                     ))
-                elif new_s == State.NOMINAL:
-                    event_log.appendleft(_Event(
-                        sim_time, "INFO",
-                        f"SAT {sat.sat_id} → NOMINAL threat cleared"
-                    ))
-            prev_states[sat.sat_id] = sat.state
 
-        # ── Metrics record (every ~1 sim-second) ──────────────────────────────
-        metrics_tick += dt_sim
-        if metrics_tick >= 1.0:
-            metrics_tick = 0.0
-            metrics.update(sim_time, satellites, network)
+            ap = _all_positions(satellites, debris)
+            sat_pos = {k: v for k, v in ap.items() if k < 100}
+            network.update_topology(sat_pos)
 
-        # ── Draw ──────────────────────────────────────────────────────────────
-        renderer.draw(screen, satellites, debris, network, anim_t)
-        dashboard.draw(screen, satellites, debris, network, metrics,
-                       event_log, sim_time, sim_speed)
+            for sat in satellites:
+                sat.step(sim_time, sub, ap, network)
+            for d in debris:
+                d.step(sim_time, sub, ap, network)
+
+            network.tick(sub, satellites)
+
+            sim_time += sub
+
+            for sat in satellites:
+                if sat.state != prev_states[sat.sat_id]:
+                    new_s = sat.state
+                    if new_s == State.WARNING:
+                        event_log.appendleft(_Event(
+                            sim_time, "ALERT",
+                            f"SAT {sat.sat_id} → WARNING proximity"
+                        ))
+                        renderer.trigger_collision_flash(0.5)
+                    elif new_s == State.MANEUVERING:
+                        metrics.total_maneuvers += 1
+                        event_log.appendleft(_Event(
+                            sim_time, "MANEUVER",
+                            f"SAT {sat.sat_id} → MANEUVERING avoidance burn"
+                        ))
+                    elif new_s == State.SAFE:
+                        event_log.appendleft(_Event(
+                            sim_time, "INFO",
+                            f"SAT {sat.sat_id} → SAFE maneuver complete"
+                        ))
+                    elif new_s == State.NOMINAL:
+                        event_log.appendleft(_Event(
+                            sim_time, "INFO",
+                            f"SAT {sat.sat_id} → NOMINAL threat cleared"
+                        ))
+                prev_states[sat.sat_id] = sat.state
+
+            metrics_tick += sub
+            while metrics_tick >= 1.0:
+                metrics_tick -= 1.0
+                metrics.update(sim_time, satellites, network)
+
+            curr_snap = _all_positions(satellites, debris)
+
+        if substeps_this_frame:
+            t = 1.0 - (sim_accum / FIXED_SIM_DT) if FIXED_SIM_DT > 0 else 1.0
+            disp = _interpolated_positions(prev_snap, curr_snap, t)
+        else:
+            disp = dict(curr_snap)
+        renderer.draw(
+            screen, satellites, debris, network, anim_t,
+            display_positions=disp,
+            screen_wh=(SCREEN_WIDTH, SCREEN_HEIGHT),
+            selected_sat=selected_sat,
+        )
+        dashboard.draw(
+            screen, satellites, debris, network, metrics,
+            event_log, sim_time, sim_speed,
+            display_positions=disp, chaos_mode=chaos_mode, anim_t=anim_t,
+        )
         pygame.display.flip()
 
-    # ── Cleanup / export ──────────────────────────────────────────────────────
     metrics.export_csv(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.csv")
     )
@@ -238,7 +358,7 @@ def run_simulation_test(ticks=100, dt=1.0):
             sat.step(sim_time, dt, ap, net)
         for d in debris:
             d.step(sim_time, dt, ap, net)
-        net.tick(dt)
+        net.tick(dt, satellites)
         sim_time += dt
 
     print()

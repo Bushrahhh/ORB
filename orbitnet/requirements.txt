@@ -2,3 +2,4 @@ pygame-ce>=2.5.7   # pygame Community Edition — supports Python 3.14+
 networkx>=3.0
 numpy>=1.26.0
 pandas>=2.0.0
+matplotlib>=3.8.0

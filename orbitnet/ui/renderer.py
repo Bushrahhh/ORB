@@ -2,6 +2,7 @@ import math
 import random
 import sys
 import os
+import time
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -32,12 +33,8 @@ _EL       = math.radians(25.0)
 _COS_AZ, _SIN_AZ = math.cos(_AZ), math.sin(_AZ)
 _COS_EL, _SIN_EL = math.cos(_EL), math.sin(_EL)
 
-# ── Pre-baked star field (fixed seed for consistency) ───────────────────────
-_rng = random.Random(31337)
-_STARS = [
-    (_rng.randint(0, VP_W - 1), _rng.randint(0, VP_H - 1), _rng.randint(80, 200))
-    for _ in range(220)
-]
+# ── Star field: 200 static white / purple dots (generated at first renderer init)
+_STARFIELD: list[tuple[int, int, tuple[int, int, int]]] = []
 
 # ── Color aliases ───────────────────────────────────────────────────────────
 _C = COLORS
@@ -139,46 +136,93 @@ _RING_PTS = [_ring_points(p) for p in range(NUM_ORBITAL_PLANES)]
 
 
 # ════════════════════════════════════════════════════════════════════════════
+def _build_starfield() -> list[tuple[int, int, tuple[int, int, int]]]:
+    rng = random.Random(31337)
+    stars: list[tuple[int, int, tuple[int, int, int]]] = []
+    for _ in range(200):
+        x, y = rng.randint(0, VP_W - 1), rng.randint(0, VP_H - 1)
+        if rng.random() < 0.55:
+            c = (rng.randint(220, 255), rng.randint(220, 255), rng.randint(235, 255))
+        else:
+            c = (rng.randint(160, 220), rng.randint(120, 190), rng.randint(230, 255))
+        stars.append((x, y, c))
+    return stars
+
+
 class OrbitalRenderer:
     def __init__(self):
+        global _STARFIELD
+        if not _STARFIELD:
+            _STARFIELD = _build_starfield()
         self._font_sat  = None
         self._font_gs   = None
+        self._font_popup = None
         # Reusable alpha surfaces (allocated after pygame.init)
         self._overlay: pygame.Surface | None = None
         self._glow_surf: pygame.Surface | None = None
         self._warn_r_px = max(1, int(WARNING_THRESHOLD_KM * ORBIT_SCALE))
+        self._collision_flash_until: float = 0.0
 
     def init_fonts(self):
         self._font_sat = pygame.font.SysFont("monospace", 9)
         self._font_gs  = pygame.font.SysFont("monospace", 10, bold=True)
+        self._font_popup = pygame.font.SysFont("monospace", 11)
         self._overlay   = pygame.Surface((VP_W, VP_H), pygame.SRCALPHA)
         glow_r = EARTH_R_PX + 50
         self._glow_surf = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
 
+    def trigger_collision_flash(self, duration_s: float = 0.5) -> None:
+        self._collision_flash_until = time.monotonic() + duration_s
+
     # ── Master draw call ────────────────────────────────────────────────────
-    def draw(self, surface: pygame.Surface, satellites: list,
-             debris_list: list, network, anim_t: float) -> None:
+    def draw(
+        self,
+        surface: pygame.Surface,
+        satellites: list,
+        debris_list: list,
+        network,
+        anim_t: float,
+        display_positions: dict | None = None,
+        screen_wh: tuple[int, int] | None = None,
+        selected_sat=None,
+    ) -> None:
+        if display_positions is None:
+            display_positions = {s.sat_id: s.position for s in satellites}
+            display_positions.update(
+                {d.debris_id: d.position for d in debris_list}
+            )
         self._draw_background(surface)
         self._draw_orbital_rings(surface)
-        self._draw_network_edges(surface, satellites, network, anim_t)
-        self._draw_packets(surface, satellites, network)
+        self._draw_network_edges(surface, satellites, network, anim_t, display_positions)
+        self._draw_packets(surface, satellites, network, display_positions)
         self._draw_earth(surface, anim_t)
         self._draw_ground_stations(surface, network)
-        self._draw_danger_zones(surface, satellites, anim_t)
-        self._draw_debris(surface, debris_list)
-        self._draw_satellites(surface, satellites, anim_t)
-        self._draw_maneuver_arrows(surface, satellites)
+        self._draw_danger_zones(surface, satellites, anim_t, display_positions)
+        self._draw_debris(surface, debris_list, display_positions)
+        self._draw_satellites(surface, satellites, anim_t, display_positions, selected_sat)
+        self._draw_maneuver_arrows(surface, satellites, display_positions)
+        if screen_wh:
+            self._draw_collision_flash_border(surface, screen_wh[0], screen_wh[1])
+        if selected_sat is not None and self._font_popup:
+            self._draw_satellite_popup(surface, selected_sat, network, display_positions)
 
     # ── Background + stars ──────────────────────────────────────────────────
     def _draw_background(self, surface: pygame.Surface) -> None:
-        # Fill only the left viewport — dashboard draws its own BG
         pygame.draw.rect(surface, BG, (0, 0, VP_W, VP_H))
-        for sx, sy, brightness in _STARS:
-            b = brightness
-            surface.set_at((sx, sy), (b // 4, 0, b // 3))
-            if brightness > 170:            # brighter stars get a 1-px halo
-                surface.set_at((sx + 1, sy), (b // 8, 0, b // 6))
-                surface.set_at((sx, sy + 1), (b // 8, 0, b // 6))
+        for sx, sy, col in _STARFIELD:
+            surface.set_at((sx, sy), col)
+
+    def _draw_collision_flash_border(
+        self, surface: pygame.Surface, screen_w: int, screen_h: int
+    ) -> None:
+        if time.monotonic() >= self._collision_flash_until:
+            return
+        pink = (255, 120, 200)
+        t = 5
+        pygame.draw.rect(surface, pink, (0, 0, screen_w, t))
+        pygame.draw.rect(surface, pink, (0, screen_h - t, screen_w, t))
+        pygame.draw.rect(surface, pink, (0, 0, t, screen_h))
+        pygame.draw.rect(surface, pink, (screen_w - t, 0, t, screen_h))
 
     # ── Orbital path rings ──────────────────────────────────────────────────
     def _draw_orbital_rings(self, surface: pygame.Surface) -> None:
@@ -191,11 +235,14 @@ class OrbitalRenderer:
         surface.blit(ov, (0, 0))
 
     # ── ISL + uplink edges ──────────────────────────────────────────────────
-    def _draw_network_edges(self, surface, satellites, network, anim_t):
+    def _draw_network_edges(self, surface, satellites, network, anim_t, display_positions):
         ov = self._overlay
         ov.fill((0, 0, 0, 0))
 
-        sat_screen = {s.sat_id: _proj(s.position) for s in satellites}
+        sat_screen = {
+            s.sat_id: _proj(display_positions.get(s.sat_id, s.position))
+            for s in satellites
+        }
         gs_screen  = {}
         for n, data in network.graph.nodes(data=True):
             if isinstance(n, str) and n.startswith("GS"):
@@ -244,8 +291,11 @@ class OrbitalRenderer:
         surface.blit(ov, (0, 0))
 
     # ── Packet animation dots ───────────────────────────────────────────────
-    def _draw_packets(self, surface, satellites, network):
-        sat_screen = {s.sat_id: _proj(s.position) for s in satellites}
+    def _draw_packets(self, surface, satellites, network, display_positions):
+        sat_screen = {
+            s.sat_id: _proj(display_positions.get(s.sat_id, s.position))
+            for s in satellites
+        }
         gs_screen  = {}
         for n, data in network.graph.nodes(data=True):
             if isinstance(n, str) and n.startswith("GS"):
@@ -266,8 +316,8 @@ class OrbitalRenderer:
                 col = PKT_DATA
                 r = 3
             pygame.draw.circle(surface, col, pos, r)
-            # Tiny glow ring
-            pygame.draw.circle(surface, (*col, 80), pos, r + 2, 1)
+            dim = tuple(max(0, c - 55) for c in col)
+            pygame.draw.circle(surface, dim, pos, r + 1, 1)
 
     # ── Earth ───────────────────────────────────────────────────────────────
     def _draw_earth(self, surface, anim_t):
@@ -319,7 +369,7 @@ class OrbitalRenderer:
                                 sy + oy - lbl.get_height() // 2))
 
     # ── Danger zones (WARNING satellites) ───────────────────────────────────
-    def _draw_danger_zones(self, surface, satellites, anim_t):
+    def _draw_danger_zones(self, surface, satellites, anim_t, display_positions):
         ov = self._overlay
         ov.fill((0, 0, 0, 0))
         wr = self._warn_r_px
@@ -327,17 +377,19 @@ class OrbitalRenderer:
         for sat in satellites:
             if sat.state not in (State.WARNING, State.MANEUVERING):
                 continue
-            sx, sy = _proj(sat.position)
+            pos = display_positions.get(sat.sat_id, sat.position)
+            sx, sy = _proj(pos)
             a_fill = max(0, min(255, pulse))
             pygame.draw.circle(ov, (*DANGER_C, a_fill), (sx, sy), wr)
             pygame.draw.circle(ov, (*DANGER_C, a_fill + 40), (sx, sy), wr, 2)
         surface.blit(ov, (0, 0))
 
     # ── Debris (X marks) ────────────────────────────────────────────────────
-    def _draw_debris(self, surface, debris_list):
+    def _draw_debris(self, surface, debris_list, display_positions):
         col = (180, 60, 60)
         for d in debris_list:
-            sx, sy = _proj(d.position)
+            pos = display_positions.get(d.debris_id, d.position)
+            sx, sy = _proj(pos)
             s = 5
             pygame.draw.line(surface, col, (sx - s, sy - s), (sx + s, sy + s), 1)
             pygame.draw.line(surface, col, (sx - s, sy + s), (sx + s, sy - s), 1)
@@ -345,12 +397,14 @@ class OrbitalRenderer:
             pygame.draw.circle(surface, (100, 30, 30), (sx, sy), s + 3, 1)
 
     # ── Satellites ──────────────────────────────────────────────────────────
-    def _draw_satellites(self, surface, satellites, anim_t):
+    def _draw_satellites(self, surface, satellites, anim_t, display_positions, selected_sat):
         ov = self._overlay
         for sat in satellites:
-            sx, sy = _proj(sat.position)
+            pos = display_positions.get(sat.sat_id, sat.position)
+            sx, sy = _proj(pos)
             col = _STATE_COLOR[sat.state]
             r = 6
+            sel = selected_sat is not None and sat.sat_id == selected_sat.sat_id
 
             if sat.state == State.MANEUVERING:
                 pulse = 0.5 + 0.5 * math.sin(anim_t * 10.0)
@@ -365,27 +419,96 @@ class OrbitalRenderer:
 
             pygame.draw.circle(surface, col, (sx, sy), r)
             pygame.draw.circle(surface, (255, 255, 255), (sx, sy), r, 1)
+            if sel:
+                pygame.draw.circle(surface, (255, 255, 120), (sx, sy), r + 4, 2)
 
             if self._font_sat:
                 lbl = self._font_sat.render(f"S{sat.sat_id}", True, TXT_SEC)
                 surface.blit(lbl, (sx + r + 2, sy - 4))
 
     # ── Maneuver arrows ──────────────────────────────────────────────────────
-    def _draw_maneuver_arrows(self, surface, satellites):
+    def _draw_maneuver_arrows(self, surface, satellites, display_positions):
         for sat in satellites:
             if sat.state != State.MANEUVERING:
                 continue
-            sx, sy = _proj(sat.position)
+            pos = display_positions.get(sat.sat_id, sat.position)
+            sx, sy = _proj(pos)
             mx, my, mz = sat.maneuver_vector
             mag = math.hypot(mx, my)
             if mag < 1e-9:
                 continue
-            # Project delta-v direction: use position + scaled maneuver vector
             tip_3d = (
-                sat.position[0] + mx * 5000,
-                sat.position[1] + my * 5000,
-                sat.position[2] + mz * 5000,
+                pos[0] + mx * 5000,
+                pos[1] + my * 5000,
+                pos[2] + mz * 5000,
             )
             tx, ty = _proj(tip_3d)
             _draw_arrow(surface, (sx, sy), (tx, ty), SAT_MAN, shaft_w=2,
                         head_len=8, head_w=5)
+
+    def pick_satellite_at(
+        self,
+        satellites: list,
+        mx: int,
+        my: int,
+        radius_px: float = 14.0,
+        display_positions: dict | None = None,
+    ):
+        """Return satellite under pixel (mx, my) in viewport, else None."""
+        if mx < 0 or mx >= VP_W or my < 0 or my >= VP_H:
+            return None
+        best = None
+        best_d = radius_px * radius_px
+        for sat in satellites:
+            pos = (
+                display_positions.get(sat.sat_id, sat.position)
+                if display_positions
+                else sat.position
+            )
+            sx, sy = _proj(pos)
+            dx, dy = sx - mx, sy - my
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d:
+                best_d = d2
+                best = sat
+        return best
+
+    def _isl_neighbor_ids(self, network, sat_id: int) -> list[int]:
+        out = []
+        if not network.graph.has_node(sat_id):
+            return out
+        for n in network.graph.neighbors(sat_id):
+            if isinstance(n, int) and network.graph[sat_id][n].get("kind") == "isl":
+                out.append(n)
+        return sorted(out)
+
+    def _draw_satellite_popup(self, surface, sat, network, display_positions) -> None:
+        pos = display_positions.get(sat.sat_id, sat.position)
+        px, py = _proj(pos)
+        lines = [
+            f"Satellite {sat.sat_id}",
+            f"State: {sat.state.name}",
+            f"Position (km): ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})",
+            f"Velocity (km/s): ({sat.velocity[0]:.4f}, {sat.velocity[1]:.4f}, {sat.velocity[2]:.4f})",
+            f"Messages sent / recv: {sat.messages_sent} / {sat.messages_received}",
+            f"Near-miss count: {sat.near_miss_count}",
+            f"ISL links: {self._isl_neighbor_ids(network, sat.sat_id)}",
+            f"Packet queue (in-flight): {network.in_flight_queue_depth(sat.sat_id)}",
+        ]
+        pad = 10
+        line_h = 15
+        w = max(self._font_popup.render(s, True, TXT_PRI).get_width() for s in lines)
+        w += pad * 2
+        h = pad * 2 + len(lines) * line_h
+        bx = min(max(8, px - w // 2), VP_W - w - 8)
+        by = min(max(8, py - h - 24), VP_H - h - 8)
+        bg = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.rect(bg, (12, 4, 32, 235), (0, 0, w, h), border_radius=6)
+        pygame.draw.rect(bg, (*SAT_WARN, 220), (0, 0, w, h), 2, border_radius=6)
+        surface.blit(bg, (bx, by))
+        y = by + pad
+        for i, s in enumerate(lines):
+            col = TXT_PRI if i > 0 else SAT_NOM
+            surf = self._font_popup.render(s, True, col)
+            surface.blit(surf, (bx + pad, y))
+            y += line_h

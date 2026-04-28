@@ -150,12 +150,12 @@ class SatelliteAgent:
     # ------------------------------------------------------------------
 
     def broadcast_alert(self, network, threat_id: int,
-                        threat_distance: float) -> None:
+                        threat_distance: float, sim_time: float) -> None:
         nearest_gs = "GS0"      # simplified: always alert GS0
         pkt = CollisionAlertPacket(
             source=self.sat_id,
             destination=nearest_gs,
-            created_at=0.0,     # caller may set sim_time
+            created_at=sim_time,
             threat_id=threat_id,
             threat_distance=threat_distance,
         )
@@ -203,7 +203,7 @@ class SatelliteAgent:
         # 3. Broadcast alert when entering WARNING or MANEUVERING
         if threats and self.state in (State.WARNING, State.MANEUVERING):
             closest_id, closest_d = min(threats, key=lambda t: t[1])
-            self.broadcast_alert(network, closest_id, closest_d)
+            self.broadcast_alert(network, closest_id, closest_d, sim_time)
 
         # 4. Periodic telemetry
         self._telemetry_clock += dt
@@ -279,3 +279,72 @@ def create_debris(orb: OrbitalMechanics, count: int = 5) -> list[DebrisAgent]:
         DebrisAgent(debris_id=_DEBRIS_ID_OFFSET + k, orb=orb, seed=k)
         for k in range(count)
     ]
+
+
+def _unit3(v: tuple[float, float, float]) -> tuple[float, float, float]:
+    m = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) or 1.0
+    return (v[0] / m, v[1] / m, v[2] / m)
+
+
+class InterceptDebris:
+    """
+    Debris chunk on a near-collision trajectory (constant velocity, demo physics).
+    """
+
+    def __init__(self, debris_id: int,
+                 position: tuple[float, float, float],
+                 velocity: tuple[float, float, float]):
+        self.debris_id = debris_id
+        self.position = position
+        self.velocity = velocity
+        self.state: State = State.NOMINAL
+
+    def step(self, sim_time: float, dt: float,
+             all_positions: dict, network) -> None:
+        vx, vy, vz = self.velocity
+        px, py, pz = self.position
+        self.position = (px + vx * dt, py + vy * dt, pz + vz * dt)
+
+
+def spawn_chaos_debris(
+    debris_id: int,
+    target_position: tuple[float, float, float],
+    rng: random.Random,
+    speed: float = 0.42,
+) -> InterceptDebris:
+    """Spawn debris on an intercept-like path toward ``target_position``."""
+    # Random offset from target (40–140 km)
+    u = rng.random()
+    v = rng.random()
+    theta = 2.0 * math.pi * u
+    phi = math.acos(2.0 * v - 1.0)
+    r = rng.uniform(40.0, 140.0)
+    ox = r * math.sin(phi) * math.cos(theta)
+    oy = r * math.sin(phi) * math.sin(theta)
+    oz = r * math.cos(phi)
+    pos = (
+        target_position[0] + ox,
+        target_position[1] + oy,
+        target_position[2] + oz,
+    )
+    toward = _unit3((
+        target_position[0] - pos[0],
+        target_position[1] - pos[1],
+        target_position[2] - pos[2],
+    ))
+    # Small perpendicular component for visual crossing paths
+    perp = _unit3((
+        toward[1] - toward[2],
+        toward[2] - toward[0],
+        toward[0] - toward[1],
+    ))
+    t = rng.uniform(0.15, 0.45)
+    vel = (
+        toward[0] * speed + perp[0] * speed * t,
+        toward[1] * speed + perp[1] * speed * t,
+        toward[2] * speed + perp[2] * speed * t,
+    )
+    mag = math.sqrt(vel[0] ** 2 + vel[1] ** 2 + vel[2] ** 2) or 1.0
+    scale = speed / mag
+    vel = (vel[0] * scale, vel[1] * scale, vel[2] * scale)
+    return InterceptDebris(debris_id, pos, vel)
