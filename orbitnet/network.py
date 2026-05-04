@@ -1,9 +1,12 @@
 import math
+from collections import deque
+
 import networkx as nx
 
 from config import ISL_MAX_RANGE_KM, EARTH_RADIUS_KM
 from physics import OrbitalMechanics
 from routing import RoutingEngine
+from packets import TelemetryPacket, AvoidanceCommandPacket
 
 # Speed of light in km/ms
 _C_KM_MS = 299_792.458 / 1_000.0
@@ -39,6 +42,11 @@ class ConstellationNetwork:
         self.total_packets_sent = 0
         self.total_delivered = 0
         self._latencies: list[float] = []
+
+        # UI / visualization (drained by main loop)
+        self._ui_events: list[tuple[str, str]] = []
+        self._recent_routes: deque = deque(maxlen=5)
+        self._telemetry_log_i: int = 0
 
         # Add ground station nodes (fixed)
         for label, lat, lon in _GROUND_STATIONS:
@@ -124,6 +132,23 @@ class ConstellationNetwork:
 
         packet.path = path[:]
         self.total_packets_sent += 1
+
+        ptype = type(packet).__name__.replace("Packet", "")
+        hops = len(path) - 1
+        self._recent_routes.append((path[:], ptype, packet.source, packet.destination))
+        if isinstance(packet, TelemetryPacket):
+            self._telemetry_log_i += 1
+            if self._telemetry_log_i % 6 == 0:
+                self._ui_events.append((
+                    "TELEMETRY",
+                    f"Telemetry SAT {packet.source} -> {packet.destination} ({hops} hops)",
+                ))
+        elif isinstance(packet, AvoidanceCommandPacket):
+            self._ui_events.append((
+                "MANEUVER",
+                f"Avoidance cmd -> SAT {packet.target_sat_id}",
+            ))
+
         # Compute total path delay
         total_delay = sum(
             self.graph[path[i]][path[i + 1]].get("propagation_delay_ms", 0.0)
@@ -171,6 +196,11 @@ class ConstellationNetwork:
                 dest = pkt.destination
                 if isinstance(dest, int) and dest in by_id:
                     by_id[dest].messages_received += 1
+                ptn = type(pkt).__name__.replace("Packet", "")
+                self._ui_events.append((
+                    "DELIVERY",
+                    f"Delivered {ptn} to {pkt.destination} ({pkt.hops} hops)",
+                ))
             else:
                 entry[1] = remaining
                 still_flying.append(entry)
@@ -213,6 +243,20 @@ class ConstellationNetwork:
             if pkt.path and sat_id in pkt.path:
                 n += 1
         return n
+
+    def drain_ui_events(self) -> list[tuple[str, str]]:
+        ev = self._ui_events[:]
+        self._ui_events.clear()
+        return ev
+
+    def get_recent_packet_traces(self) -> list[tuple[list, str, int | str, int | str]]:
+        """Last up to 5 routed paths: (path, type_name, src, dst)."""
+        return list(self._recent_routes)
+
+    def get_latest_route_path(self) -> list | None:
+        if not self._recent_routes:
+            return None
+        return self._recent_routes[-1][0][:]
 
     def get_network_stats(self) -> dict:
         util = self.get_link_utilization()

@@ -22,6 +22,7 @@ from network import ConstellationNetwork
 from metrics import MetricsCollector
 from ui.renderer import OrbitalRenderer
 from ui.dashboard import MetricsDashboard
+from ui.analytics import AnalyticsPanel
 
 # Internal physics step (sim seconds). Smaller = smoother motion at high time warp.
 FIXED_SIM_DT = 0.05
@@ -69,6 +70,13 @@ def _next_debris_id(debris_list):
     return max((d.debris_id for d in debris_list), default=99) + 1
 
 
+def _threat_level_pct(satellites, metrics) -> float:
+    nm = metrics.total_near_misses if metrics else 0
+    man = sum(1 for s in satellites if s.state == State.MANEUVERING)
+    wrn = sum(1 for s in satellites if s.state == State.WARNING)
+    return min(100.0, float(nm * 10 + man * 25 + wrn * 5))
+
+
 def _run_analysis_and_open():
     base = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(base, "results.csv")
@@ -103,10 +111,13 @@ def run():
     renderer   = OrbitalRenderer()
     dashboard  = MetricsDashboard()
 
+    analytics    = AnalyticsPanel()
     renderer.init_fonts()
     dashboard.init_fonts()
+    analytics.init_fonts()
 
     sim_time     = 0.0
+    analytics_mode = False
     sim_speed    = SIMULATION_SPEED
     paused       = False
     event_log    = collections.deque(maxlen=50)
@@ -114,6 +125,7 @@ def run():
     chaos_inj_accum = 0.0
     next_debris_id = _next_debris_id(debris)
     selected_sat = None
+    packet_tracer_mode = False
 
     ap = _all_positions(satellites, debris)
     network.update_topology({k: v for k, v in ap.items() if k < 100})
@@ -152,12 +164,20 @@ def run():
                         sim_time, "INFO",
                         f"Chaos mode {'ON' if chaos_mode else 'OFF'}"
                     ))
+                elif ev.key == pygame.K_t:
+                    packet_tracer_mode = not packet_tracer_mode
+                    event_log.appendleft(_Event(
+                        sim_time, "INFO",
+                        f"Packet tracer {'ON' if packet_tracer_mode else 'OFF'}"
+                    ))
                 elif ev.key == pygame.K_g:
                     out_csv = os.path.join(
                         os.path.dirname(os.path.abspath(__file__)), "results.csv"
                     )
                     metrics.export_csv(out_csv)
                     _run_analysis_and_open()
+                elif ev.key == pygame.K_p:
+                    analytics_mode = not analytics_mode
                 elif ev.key == pygame.K_r:
                     satellites  = create_constellation(orb)
                     debris      = create_debris(orb, count=5)
@@ -168,6 +188,7 @@ def run():
                     chaos_inj_accum = 0.0
                     next_debris_id = _next_debris_id(debris)
                     selected_sat = None
+                    packet_tracer_mode = False
                     event_log.clear()
                     event_log.appendleft(_Event(0.0, "INFO", "Simulation RESET"))
                     prev_states = {s.sat_id: s.state for s in satellites}
@@ -186,21 +207,32 @@ def run():
 
         if paused:
             disp = _all_positions(satellites, debris)
-            renderer.draw(
-                screen, satellites, debris, network, anim_t,
-                display_positions=disp,
-                screen_wh=(SCREEN_WIDTH, SCREEN_HEIGHT),
-                selected_sat=selected_sat,
-            )
-            dashboard.draw(
-                screen, satellites, debris, network, metrics,
-                event_log, sim_time, sim_speed,
-                display_positions=disp, chaos_mode=chaos_mode, anim_t=anim_t,
-            )
-            font = pygame.font.SysFont("monospace", 28, bold=True)
-            txt  = font.render("  PAUSED  ", True, COLORS["TEXT_PRIMARY"],
-                               COLORS["PANEL_BG"])
-            screen.blit(txt, (450 - txt.get_width() // 2, 430))
+            threat = _threat_level_pct(satellites, metrics)
+            st = network.get_network_stats()
+            metrics.chart_latency_ms.append(float(st["avg_latency_ms"]))
+            metrics.chart_near_misses.append(int(metrics.total_near_misses))
+            if analytics_mode:
+                analytics.draw(screen, satellites, debris, network,
+                               metrics, sim_time, anim_t)
+            else:
+                renderer.draw(
+                    screen, satellites, debris, network, anim_t,
+                    display_positions=disp,
+                    screen_wh=(SCREEN_WIDTH, SCREEN_HEIGHT),
+                    selected_sat=selected_sat,
+                    packet_tracer=packet_tracer_mode,
+                    threat_pct=threat,
+                )
+                dashboard.draw(
+                    screen, satellites, debris, network, metrics,
+                    event_log, sim_time, sim_speed,
+                    display_positions=disp, chaos_mode=chaos_mode, anim_t=anim_t,
+                    selected_sat_id=selected_sat.sat_id if selected_sat else None,
+                )
+                font = pygame.font.SysFont("monospace", 28, bold=True)
+                txt  = font.render("  PAUSED  ", True, COLORS["TEXT_PRIMARY"],
+                                   COLORS["PANEL_BG"])
+                screen.blit(txt, (450 - txt.get_width() // 2, 430))
             pygame.display.flip()
             continue
 
@@ -226,7 +258,7 @@ def run():
                         )
                         next_debris_id += 1
                     event_log.appendleft(_Event(
-                        sim_time, "INFO",
+                        sim_time, "DEBRIS",
                         "Chaos: injected 3 intercept debris objects"
                     ))
 
@@ -242,6 +274,9 @@ def run():
             network.tick(sub, satellites)
 
             sim_time += sub
+
+            for cat, msg in network.drain_ui_events():
+                event_log.appendleft(_Event(sim_time, cat, msg))
 
             for sat in satellites:
                 if sat.state != prev_states[sat.sat_id]:
@@ -282,17 +317,30 @@ def run():
             disp = _interpolated_positions(prev_snap, curr_snap, t)
         else:
             disp = dict(curr_snap)
-        renderer.draw(
-            screen, satellites, debris, network, anim_t,
-            display_positions=disp,
-            screen_wh=(SCREEN_WIDTH, SCREEN_HEIGHT),
-            selected_sat=selected_sat,
-        )
-        dashboard.draw(
-            screen, satellites, debris, network, metrics,
-            event_log, sim_time, sim_speed,
-            display_positions=disp, chaos_mode=chaos_mode, anim_t=anim_t,
-        )
+
+        st = network.get_network_stats()
+        metrics.chart_latency_ms.append(float(st["avg_latency_ms"]))
+        metrics.chart_near_misses.append(int(metrics.total_near_misses))
+        threat = _threat_level_pct(satellites, metrics)
+
+        if analytics_mode:
+            analytics.draw(screen, satellites, debris, network,
+                           metrics, sim_time, anim_t)
+        else:
+            renderer.draw(
+                screen, satellites, debris, network, anim_t,
+                display_positions=disp,
+                screen_wh=(SCREEN_WIDTH, SCREEN_HEIGHT),
+                selected_sat=selected_sat,
+                packet_tracer=packet_tracer_mode,
+                threat_pct=threat,
+            )
+            dashboard.draw(
+                screen, satellites, debris, network, metrics,
+                event_log, sim_time, sim_speed,
+                display_positions=disp, chaos_mode=chaos_mode, anim_t=anim_t,
+                selected_sat_id=selected_sat.sat_id if selected_sat else None,
+            )
         pygame.display.flip()
 
     metrics.export_csv(

@@ -1,5 +1,6 @@
 import csv
 import math
+from collections import deque
 from dataclasses import dataclass, asdict
 
 from config import NUM_SATELLITES
@@ -47,6 +48,8 @@ class MetricsCollector:
         self.total_near_misses: int = 0
         self.min_separation_km: float = math.inf
         self._last_near_miss_counts: dict[int, int] = {}
+        self.chart_latency_ms: deque[float] = deque(maxlen=120)
+        self.chart_near_misses: deque[int] = deque(maxlen=120)
 
     def update(self, sim_time: float, satellites: list, network) -> None:
         """Record one frame of metrics."""
